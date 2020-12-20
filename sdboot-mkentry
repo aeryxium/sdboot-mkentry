@@ -1,0 +1,381 @@
+#!/bin/bash
+
+# sdboot-mkentry - Create a systemd-boot entry file with given parameters.
+
+#    Copyright (c) 2020 Aeryxium <aeryxium+sdboot@gamil.com>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Set shell options
+set -o nounset
+shopt -s extglob failglob
+
+# Constants
+declare -r esp_guid="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+declare -r xbootldr_guid="bc13c2ff-59e6-4262-a352-b275fd6f7172"
+
+declare -r usage_text="sdboot-mkentry - Create a systemd-boot entry file.
+
+Usage:
+    sdboot-mkentry [-h] [-o opts] -k kernel -t title filename
+
+-h,--help               display this text
+-o,--opts \"opts\"        additional string to append to 'options' line
+-k,--kernel \"kernel\"    kernel to use (vmlinuz and initramfs must exist)
+-t,--title \"title\"      entry title to display in boot menu
+
+'filename' should not include a path.
+
+'root' and, if needed, 'cryptdevice' and 'rootflags' will be confgiured
+automatically, and any CPU microcode that's installed will be included. The
+root partition will be specified to be mounted in rw mode."
+
+# Default arguments
+opts=""
+
+# msg1 - Outputs a primary message
+# Arguments:
+#     str - Message
+msg1() {
+	printf "==> %b" "$1"
+}
+
+# msg2 - Outputs a secondary message
+# Arguments:
+#     str- Message
+msg2() {
+	printf "  -> %b" "$1"
+}
+
+# error - Output an error message
+# Arguments:
+#     str - Message
+error() {
+	printf "%s: %b" "${red_colour}ERROR${reset_colour}" "$1" >&6
+}
+
+# warn - Output an warning message
+# Arguments:
+#     str - Message
+warn() {
+	printf "%s: %b" "${yellow_colour}WARNING${reset_colour}" "$1" >&6
+}
+
+# fail - Output a fail message
+# Arguments:
+#     none
+fail() {
+	printf "%s\n" "${red_colour}Fail.${reset_colour}"
+}
+
+# pass - Output a pass message
+# Arguments:
+#     none
+pass() {
+	printf "%s\n" "${green_colour}Pass.${reset_colour}"
+}
+
+# colour - Sets up colours for outputting messages
+# Arguments:
+#     none
+colour() {
+	# Don't set error colour if stderr isn't on terminal
+	if [ -t 2 ]; then
+		# Prefer tput if available
+		if tput setaf 0 &>/dev/null; then
+			reset_colour="$(tput sgr0)"
+			red_colour="$(tput setaf 1)"
+			green_colour="$(tput setaf 2)"
+			yellow_colour="$(tput setaf 3)"
+		else
+			reset_colour="\e[0m"
+			red_colour="\e[31m"
+			green_colour="\e[32m"
+			yellow_colour="\e[33m"
+		fi
+	else
+		reset_colour=""
+		red_colour=""
+		green_colour=""
+		yellow_colour=""
+	fi
+	readonly reset_colour red_colour green_colour yellow_colour
+}
+
+# parseopts - Parse command line arguments
+# Arguments:
+#     str - Arguments to be parsed
+parseopts() {
+	for arg in "$@"; do
+		shift
+		case "$arg" in
+		"--help")      set -- "$@" "-h" ;;
+		"--debug")     set -- "$@" "-d" ;;
+		"--opts")      set -- "$@" "-o" ;;
+		"--kernel")    set -- "$@" "-k" ;;
+		"--title")     set -- "$@" "-t" ;;
+		*)             set -- "$@" "$arg"
+		esac
+	done
+	params=()
+	while [ $OPTIND -le "$#" ]; do
+		if getopts :hdo:k:t: arg; then
+			case "${arg}" in
+			h)
+				printf "%s\n" "${usage_text}"
+				exit 0 ;;
+			d)      # Hidden developer option
+				debug="true" ;;
+			o)
+				opts="${OPTARG}" ;;
+			k)
+				kernel="${OPTARG}" ;;
+			t)
+				title="${OPTARG}" ;;
+			:)
+				printf "%s\n\n" "${usage_text}"
+				error "'-${OPTARG}' needs an argument.\n"
+				exit 1 ;;
+			?)
+				printf "%s\n\n" "${usage_text}"
+				error "Unknown option -${OPTARG}.\n"
+				exit 1 ;;
+			esac
+		else
+			params+=("${!OPTIND}")
+			((OPTIND++))
+		fi
+	done
+	if [ "${#params[@]}" -ne 1 ]; then
+		printf "%s\n\n" "${usage_text}"
+		error "A single filename is required.\n"
+		exit 1
+	else
+		filename="${params[0]}"
+	fi
+	# Debug is a hidden developer option that avoids redirecting stderr for
+	#     called programs; use fd6 for stderr outputs
+	if [[ ! "${debug:-}" = "true" ]]; then
+		exec 6>&2
+		exec 2>/dev/null
+	fi
+}
+
+# verify_root - If script isn't being run as root, display error and exit
+# Arguments:
+#     none
+verify_root() {
+	if (( EUID != 0 )); then
+		error "sdboot-mkentry needs to be run as root.\n"
+		exit 1
+	fi
+}
+
+# trap_exit - Catches trap signals
+# Arguments:
+#     str - The sigal that was caught
+trap_exit() {
+	local -r exit_code="${?:-0}"
+	local -r signal="$1"
+	if [[ "${signal}" = "EXIT" && "${exit_code}" = "0" ]]; then
+		msg1 "Completed successfully.\n"
+	else
+		printf "\n"
+		error "Received terminate. Aborting...\n"
+	fi
+	# Restore stderr and close fd6 if not in debug mode
+	if [[ "${debug:-}" = "false" ]]; then
+		exec 2>&6 6>&-
+	fi
+	trap '' EXIT
+	exit "${exit_code}"
+}
+
+# trap_setup - Setup traps for all desired signals
+# Arguments:
+#     arr - Array of signls to trap
+trap_setup() {
+	signals=("$@")
+	for signal in "${signals[@]}"; do
+		# shellcheck disable=2064
+		trap "trap_exit ${signal}" "${signal}"
+	done
+}
+
+# get_dirs - Locates mountpoint for ESP and, if it exists, XBOOTLDR
+# Arguments:
+#     none
+get_dirs() {
+	if lsblk -lo PARTTYPE | grep -q "${esp_guid}"; then
+		esp_dir="$(lsblk -lo MOUNTPOINT,PARTTYPE |
+			grep -i "${esp_guid}" | awk '{printf $1}')"
+		kernel_dir="${esp_dir}"
+	else
+		error "No ESP found. Exiting...\n"
+		exit 1
+	fi
+	# If XBOOTLDR exists, use it for kernels
+	if lsblk -lo PARTTYPE | grep -q "${xbootldr_guid}"; then
+		kernel_dir="$(lsblk -lo MOUNTPOINT,PARTTYPE |
+			grep -i "${xbootldr_guid}" | awk '{printf $1}')"
+	fi
+	entry_dir="${kernel_dir}/loader/entries"
+	filename="${entry_dir}/${filename}"
+}
+
+# verify_params - Verifies all passed parameters
+# Arguments:
+#     none
+verify_params() {
+	msg2 "Verifying filename isn't in use... "
+	if [[ -f "${filename}" ]]; then
+		fail
+		error "'${filename}' already exists. Exiting...\n"
+		exit 1
+	fi
+	pass
+	if [[ -z "${kernel:-}" ]] || [[ -z "${title:-}" ]]; then
+		printf "%s\n\n" "${usage_text}"
+		error "A kernel and entry title must be provided.\n"
+		exit 1
+	fi
+	msg2 "Verifying kernel exists... "
+	k_file="vmlinuz-${kernel}"
+	i_file="initramfs-${kernel}.img"
+	if [[ ! -f "${kernel_dir}/${k_file}" ]]; then
+		fail
+		error "'${k_file}' could not be found in ${kernel_dir}. Exiting...\n"
+		exit 1
+	fi
+	if [[ ! -f "${kernel_dir}/${i_file}" ]]; then
+		fail
+		error "'${i_file}' could not be found in ${kernel_dir}. Exiting...\n"
+		exit 1
+	fi
+	pass
+	msg2 "Verifying entry title is unused... "
+	if grep -q -E "^title\s+${title}\s*$" ${entry_dir}/*.conf; then
+		fail
+		error "An entry with title '${title}' already exists. Exiting...\n"
+		exit 1
+	fi
+	pass
+	ucodes=()
+	for ucode in ${kernel_dir}/*ucode.img; do
+		ucodes+=( "$(basename "${ucode}")" )
+	done
+	if [[ "${opts}" =~ subvol= ]]; then
+		error "Bad option; subvolume will be automatically detected. Exiting...\n"
+		exit 1
+	fi
+	if [[ "${opts}" =~ root= ]]; then
+		error "Bad option; root will be automatically detected. Exiting...\n"
+		exit 1
+	fi
+	if [[ "${opts}" =~ cryptdevice= ]]; then
+		error "Bad option; cryptdevice will be automatically detected. Exiting...\n"
+		exit 1
+	fi
+}
+
+# build_opts - Create the options line for entry
+# Arguments:
+#     none
+build_opts() {
+	msg2 "Getting root device... "
+	root_fstab="$(grep -E '\s+/\s+' /etc/fstab)"
+	root_dev="$( echo "${root_fstab}" | awk '{ print $1 }' )"
+	root_str="root=${root_dev}"
+	root_opts="$( echo "${root_fstab}" | awk '{ print $4 }' )"
+	if [[ ! -b "${root_dev}" ]]; then
+		fail
+		error "Failed to parse root device from fstab. Exiting...\n"
+		exit 1
+	fi
+	pass
+	if [[ "${root_opts}" =~ subvol= ]]; then
+		msg2 "Getting subvolume... "
+		subvol="${root_opts##*subvol=}" && subvol="${subvol%%,*}"
+		subvol_str="rootflags=subvol=@"
+		pass
+	fi
+	if [[ "${root_dev}" =~ ^/dev/mapper ]]; then
+		msg2 "Checking if mapped device is encrypted or LVM... "
+		root_type="$( lsblk -lno NAME,TYPE "${root_dev}" | awk '{ print $2 }' )"
+		if [[ "${root_type}" = "crypt" ]]; then
+			printf "crypt\n"
+			crypt_name="$( basename "${root_dev}" )"
+			crypt_dev="$( cryptsetup status "${crypt_name}" |
+					grep device: |
+					awk '{ print $2 }' )"
+			crypt_dev="$( blkid -o value -s UUID "${crypt_dev}" )"
+			crypt_str="cryptdevice=UUID=${crypt_dev}:${crypt_name} "
+		else
+			printf "${red_colour}LVM${reset_colour}\n"
+			error "LVM is not yet supported. Exiting...\n"
+			exit 1
+		fi
+	fi
+	# Will add rw so remove it if it's there
+	opts="${opts// rw / }" && opts="${opts/#rw /}"
+	if [[ -n "${subvol_str:-}" ]]; then
+		flags_str=" ${subvol_str}"
+		if [[ "${opts}" =~ rootflags= ]]; then
+			# Remove rootflags from passed options
+			pre_opts="${opts%% rootflags=*}"
+			post_opts="${opts##*rootflags=}"
+			post_opts="${post_opts#* }"
+			opts_noflags="${pre_opts:-}${post_opts:-}"
+			# Extract rootflags from passed options
+			flags="${opts##*rootflags=}" && flags="${flags%% *}"
+			flags_str+=",${flags}"
+			opts="${opts_noflags}"
+		fi
+	fi
+	full_opts="${crypt_str:-}${root_str}${flags_str:-} rw ${opts}"
+}
+
+# create_entry - Creates a systemd-boot entry using the specified parameters
+# Arguments:
+#     none
+create_entry() {
+	printf "title   %s\n" "${title}"           > "${filename}"
+	printf "linux   %s\n" "/${k_file}"        >> "${filename}"
+	for ucode in "${ucodes[@]}"; do
+		printf "initrd  %s\n" "/${ucode}" >> "${filename}"
+	done
+	printf "initrd  %s\n" "${i_file}"         >> "${filename}"
+	printf "options %s\n" "${full_opts}"      >> "${filename}"
+}
+
+# Main execution
+exec 6>&2 # Open fd6 to use as stderr
+colour
+parseopts "$@"
+verify_root
+trap_signals=( HUP INT QUIT TERM ERR EXIT )
+trap_setup "${trap_signals[@]}"
+get_dirs
+msg1 "Verifying parameters:\n"
+verify_params
+msg1 "Building options...\n"
+build_opts
+msg1 "Creating entry... "
+create_entry
+pass
